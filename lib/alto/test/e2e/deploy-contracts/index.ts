@@ -1,0 +1,182 @@
+import {
+    http,
+    type Address,
+    type Hex,
+    type PublicClient,
+    createPublicClient,
+    createWalletClient
+} from "viem"
+import { mnemonicToAccount } from "viem/accounts"
+import { foundry } from "viem/chains"
+import {
+    BASE_EIP7702_PROXY_CREATECALL,
+    BASE_EIP7702_PROXY_DEFAULT_RECEIVER_CREATECALL,
+    BASE_EIP7702_PROXY_NONCE_TRACKER_CREATECALL,
+    BASE_EIP7702_PROXY_SIMPLE_7702_ACCOUNT_VALIDATOR_V08_CREATECALL,
+    BASE_EIP7702_PROXY_SIMPLE_7702_ACCOUNT_VALIDATOR_V09_CREATECALL,
+    ENTRY_POINT_V06_CREATECALL,
+    ENTRY_POINT_V07_CREATECALL,
+    ENTRY_POINT_V08_CREATECALL,
+    ENTRY_POINT_V09_CREATECALL,
+    SIMPLE_7702_ACCOUNT_IMPLEMENTATION_V06_CREATECALL,
+    SIMPLE_7702_ACCOUNT_IMPLEMENTATION_V07_CREATECALL,
+    SIMPLE_7702_ACCOUNT_IMPLEMENTATION_V08_CREATECALL,
+    SIMPLE_7702_ACCOUNT_IMPLEMENTATION_V09_CREATECALL,
+    SIMPLE_ACCOUNT_FACTORY_V06_CREATECALL,
+    SIMPLE_ACCOUNT_FACTORY_V07_CREATECALL,
+    SIMPLE_ACCOUNT_FACTORY_V08_CREATECALL,
+    SIMPLE_ACCOUNT_FACTORY_V09_CREATECALL
+} from "./constants.js"
+
+const DETERMINISTIC_DEPLOYER = "0x4e59b44847b379578588920ca78fbf26c0b4956c"
+
+const verifyDeployed = async ({
+    addresses,
+    client
+}: { addresses: Address[]; client: PublicClient }) => {
+    for (const address of addresses) {
+        const bytecode = await client.getBytecode({
+            address
+        })
+
+        if (bytecode === undefined) {
+            console.log(`CONTRACT ${address} NOT DEPLOYED!!!`)
+            process.exit(1)
+        }
+    }
+}
+
+export async function setupContracts({ anvilRpc }: { anvilRpc: string }) {
+    let nonce = 0
+
+    const walletClient = createWalletClient({
+        account: mnemonicToAccount(
+            "test test test test test test test test test test test junk"
+        ),
+        chain: foundry,
+        transport: http(anvilRpc)
+    })
+
+    const client = createPublicClient({
+        transport: http(anvilRpc)
+    })
+
+    const deployments: { data: Hex; label: string }[] = [
+        {
+            data: SIMPLE_7702_ACCOUNT_IMPLEMENTATION_V09_CREATECALL,
+            label: "[7702] Deploying Simple7702AccountImplementation (0.9)"
+        },
+        {
+            data: SIMPLE_7702_ACCOUNT_IMPLEMENTATION_V08_CREATECALL,
+            label: "[7702] Deploying Simple7702AccountImplementation (0.8)"
+        },
+        {
+            data: SIMPLE_7702_ACCOUNT_IMPLEMENTATION_V07_CREATECALL,
+            label: "[7702] Deploying Simple7702AccountImplementation (0.7)"
+        },
+        {
+            data: SIMPLE_7702_ACCOUNT_IMPLEMENTATION_V06_CREATECALL,
+            label: "[7702] Deploying Simple7702AccountImplementation (0.6)"
+        },
+        {
+            data: ENTRY_POINT_V09_CREATECALL,
+            label: "[0.9 CORE] Deploying EntryPoint"
+        },
+        {
+            data: SIMPLE_ACCOUNT_FACTORY_V09_CREATECALL,
+            label: "[0.9 CORE] Deploying SimpleAccountFactory"
+        },
+        {
+            data: ENTRY_POINT_V08_CREATECALL,
+            label: "[0.8 CORE] Deploying EntryPoint"
+        },
+        {
+            data: SIMPLE_ACCOUNT_FACTORY_V08_CREATECALL,
+            label: "[0.8 CORE] Deploying SimpleAccountFactory"
+        },
+        {
+            data: ENTRY_POINT_V07_CREATECALL,
+            label: "[0.7 CORE] Deploying EntryPoint"
+        },
+        {
+            data: SIMPLE_ACCOUNT_FACTORY_V07_CREATECALL,
+            label: "[0.7 CORE] Deploying SimpleAccountFactory"
+        },
+        {
+            data: ENTRY_POINT_V06_CREATECALL,
+            label: "[0.6 CORE] Deploying EntryPoint"
+        },
+        {
+            data: SIMPLE_ACCOUNT_FACTORY_V06_CREATECALL,
+            label: "[0.6 CORE] Deploying SimpleAccountFactory"
+        },
+        {
+            data: BASE_EIP7702_PROXY_NONCE_TRACKER_CREATECALL,
+            label: "[BaseEIP7702Proxy] Deploying NonceTracker"
+        },
+        {
+            data: BASE_EIP7702_PROXY_DEFAULT_RECEIVER_CREATECALL,
+            label: "[BaseEIP7702Proxy] Deploying DefaultReceiver"
+        },
+        {
+            data: BASE_EIP7702_PROXY_CREATECALL,
+            label: "[BaseEIP7702Proxy] Deploying BaseEIP7702Proxy"
+        },
+        {
+            data: BASE_EIP7702_PROXY_SIMPLE_7702_ACCOUNT_VALIDATOR_V08_CREATECALL,
+            label: "[BaseEIP7702Proxy] Deploying Simple7702AccountValidator (0.8)"
+        },
+        {
+            data: BASE_EIP7702_PROXY_SIMPLE_7702_ACCOUNT_VALIDATOR_V09_CREATECALL,
+            label: "[BaseEIP7702Proxy] Deploying Simple7702AccountValidator (0.9)"
+        }
+    ]
+
+    // Send sequentially so txs arrive at anvil in nonce order. Anvil in
+    // auto-mine only mines a tx whose nonce is next; txs arriving out of
+    // order are queued and may never be flushed if no further traffic
+    // arrives, which hangs the setup.
+    const txHashes: Hex[] = []
+    for (const { data, label } of deployments) {
+        txHashes.push(
+            await walletClient.sendTransaction({
+                to: DETERMINISTIC_DEPLOYER,
+                data,
+                gas: 15_000_000n,
+                nonce: nonce++
+            })
+        )
+        console.log(label)
+    }
+
+    // Wait for all deploy/setup txs to be mined.
+    await Promise.all(
+        txHashes.map((hash) =>
+            client.waitForTransactionReceipt({ hash, pollingInterval: 50 })
+        )
+    )
+
+    await verifyDeployed({
+        client,
+        addresses: [
+            "0x4e59b44847b379578588920ca78fbf26c0b4956c", // Deterministic deployer
+            "0x433709009b8330fda32311df1c2afa402ed8d009", // EntryPoint 0.9
+            "0xf4a7018fdbf22804526ec4b77dce4f9b0d27a395", // SimpleAccountFactory 0.9
+            "0xa46cc63eBF4Bd77888AA327837d20b23A63a56B5", // Simple7702Account Implementation 0.9
+            "0x4337084d9e255ff0702461cf8895ce9e3b5ff108", // EntryPoint 0.8
+            "0x13E9ed32155810FDbd067D4522C492D6f68E5944", // SimpleAccountFactory 0.8
+            "0xe6Cae83BdE06E4c305530e199D7217f42808555B", // Simple7702Account Implementation 0.8
+            "0x0000000071727De22E5E9d8BAf0edAc6f37da032", // EntryPoint 0.7
+            "0x91E60e0613810449d098b0b5Ec8b51A0FE8c8985", // SimpleAccountFactory 0.7
+            "0xf3F57446bEC27F6531EFF3Da2B917ebA8F9BA49c", // Simple7702Account Implementation 0.7
+            "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789", // EntryPoint 0.6
+            "0x9406Cc6185a346906296840746125a0E44976454", // SimpleAcountFactory 0.6
+            "0x90c7Fc0Fe4F0188E61C131d5dB7aCa03a684a2fB", // Simple7702Account Implementation 0.6
+            "0x5ABb791E1C8EE1D023079a65874Dd4EB87b206e9", // BaseEIP7702Proxy NonceTracker
+            "0x451A6E4cE172136Dc766249cf32a4EBD63f93E7C", // BaseEIP7702Proxy DefaultReceiver
+            "0x5b10769570856Ee76EE54A463e97fCB7D20314fa", // BaseEIP7702Proxy (https://github.com/base/eip-7702-proxy)
+            "0xdf21d27991F8F4a0D1526308f620A75d1185e7a3", // BaseEIP7702Proxy Simple7702AccountValidator (0.8)
+            "0xA4d83818BD131FACa06ABC090617930b1df2AE53" // BaseEIP7702Proxy Simple7702AccountValidator (0.9)
+        ]
+    })
+}

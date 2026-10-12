@@ -1,0 +1,286 @@
+import {
+    Counter,
+    Gauge,
+    Histogram,
+    type Registry,
+    collectDefaultMetrics
+} from "prom-client"
+
+export type Metrics = ReturnType<typeof createMetrics>
+
+export function createMetrics(registry: Registry, register = true) {
+    // Skip default metrics collection in development mode or when running in Bun
+    // to avoid compatibility issues
+    const isBun = typeof (globalThis as any).Bun !== "undefined"
+
+    if (!isBun) {
+        collectDefaultMetrics({ register: registry })
+    }
+
+    const registers = register ? [registry] : []
+
+    const httpRequests = new Counter({
+        name: "alto_requests_total",
+        help: "Total number of requests",
+        labelNames: [
+            "route",
+            "rpc_method",
+            "rpc_status",
+            "code",
+            "method"
+        ] as const,
+        registers
+    })
+
+    const httpRequestsDuration = new Histogram({
+        name: "alto_requests_duration_seconds",
+        help: "Duration of requests in seconds",
+        labelNames: [
+            "route",
+            "rpc_method",
+            "rpc_status",
+            "code",
+            "method",
+            "api_version"
+        ] as const,
+        registers
+    })
+
+    const userOpsInMempool = new Gauge({
+        name: "alto_user_operations_in_mempool_count",
+        help: "Number of user operations in mempool",
+        labelNames: ["status"] as const,
+        registers
+    })
+
+    const walletsAvailable = new Gauge({
+        name: "alto_executor_wallets_available_count",
+        help: "Number of available executor wallets used to bundle",
+        labelNames: [] as const,
+        registers
+    })
+
+    const walletsTotal = new Gauge({
+        name: "alto_executor_wallets_total_count",
+        help: "Number of total executor wallets used to bundle",
+        labelNames: [] as const,
+        registers
+    })
+
+    const userOpsOnChain = new Counter({
+        name: "alto_user_operations_on_chain_total",
+        help: "Number of user operations on-chain by status",
+        labelNames: ["status"] as const,
+        registers
+    })
+
+    const userOpsSubmitted = new Counter({
+        name: "alto_user_operations_submitted_total",
+        help: "Number of user operations bundles submitted on-chain",
+        labelNames: ["status"] as const,
+        registers
+    })
+
+    const bundlesIncluded = new Counter({
+        name: "alto_bundles_included_total",
+        help: "Number of user operations bundles included on-chain",
+        labelNames: [] as const,
+        registers
+    })
+
+    const bundlesSubmitted = new Counter({
+        name: "alto_bundles_submitted_total",
+        help: "Number of user operations bundles submitted on-chain",
+        labelNames: ["status"] as const,
+        registers
+    })
+
+    const userOpsReceived = new Counter({
+        name: "alto_user_operations_received_total",
+        help: "Number of user operations received",
+        labelNames: ["status", "type"] as const,
+        registers
+    })
+
+    const userOpsValidationSuccess = new Counter({
+        name: "alto_user_operations_validation_success_total",
+        help: "Number of user operations successfully validated",
+        labelNames: [] as const,
+        registers
+    })
+
+    const userOpsValidationFailure = new Counter({
+        name: "alto_user_operations_validation_failure_total",
+        help: "Number of user operations failed to validate",
+        labelNames: [] as const,
+        registers
+    })
+
+    const userOpInclusionDuration = new Histogram({
+        name: "alto_user_operation_inclusion_duration_seconds",
+        help: "Duration of user operation inclusion from first submission to inclusion on-chain",
+        labelNames: [] as const,
+        registers,
+        buckets: [
+            0.5, 1, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 40, 50, 60, 120,
+            180, 240, 300, 600, 900, 1200
+        ]
+    })
+
+    const chainBlockTime = new Gauge({
+        name: "alto_chain_block_time_seconds",
+        help: "Configured block time of the chain in seconds",
+        labelNames: [] as const,
+        registers
+    })
+
+    const userOpInclusionDurationBlocks = new Histogram({
+        name: "alto_user_operation_inclusion_duration_blocks",
+        help: "Number of blocks from first submission to inclusion on-chain",
+        labelNames: [] as const,
+        registers,
+        buckets: [
+            0.5, 1, 1.5, 2, 3, 4, 5, 6, 8, 10, 12, 15, 20, 25, 30, 40, 50, 75,
+            100, 150, 200, 300
+        ]
+    })
+
+    const verificationGasLimitEstimationTime = new Histogram({
+        name: "alto_verification_gas_limit_estimation_time_seconds",
+        help: "Total duration of verification gas limit estimation",
+        labelNames: [] as const,
+        registers,
+        buckets: [0.1, 0.2, 0.3, 0.5, 1, 1.5, 2, 2.5, 3, 4, 5]
+    })
+
+    const verificationGasLimitEstimationCount = new Histogram({
+        name: "alto_verification_gas_limit_estimation_count",
+        help: "Number of verification gas limit estimation calls",
+        labelNames: [] as const,
+        registers,
+        buckets: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    })
+
+    const replacedTransactions = new Counter({
+        name: "alto_replaced_transactions_total",
+        help: "Number of replaced transactions",
+        labelNames: ["reason", "status"] as const,
+        registers
+    })
+
+    const userOpsResubmitted = new Counter({
+        name: "alto_user_operations_resubmitted_total",
+        help: "Number of user operations resubmitted",
+        labelNames: [] as const,
+        registers
+    })
+
+    const userOpsDropped = new Counter({
+        name: "alto_user_operations_dropped_total",
+        help: "Number of user operations dropped from mempool",
+        labelNames: ["reason"] as const,
+        registers
+    })
+
+    const userOpsSubmissionAttempts = new Histogram({
+        name: "alto_user_operations_attempts_before_inclusion",
+        help: "Number of submission attempts needed before a user operation was included on-chain",
+        labelNames: [] as const,
+        registers
+    })
+
+    const utilityWalletBalance = new Gauge({
+        name: "alto_utility_wallet_balance",
+        help: "Balance of the utility wallet",
+        labelNames: [] as const,
+        registers
+    })
+
+    const utilityWalletInsufficientBalance = new Gauge({
+        name: "alto_utility_wallet_insufficient_balance",
+        help: "Indicates if the utility wallet could not cover the last refill pass (0=OK, 1=insufficient)",
+        labelNames: [] as const,
+        registers
+    })
+
+    // How much the utility wallet is missing to fully cover executor refills
+    // Expressed in ETH for readability, consistent with other balance gauges
+    const utilityWalletMissingBalance = new Gauge({
+        name: "alto_utility_wallet_missing_balance",
+        help: "ETH missing to fully refill executor wallets (0 if sufficient)",
+        labelNames: [] as const,
+        registers
+    })
+
+    // Gauges default to 0, we remove the default value here.
+    utilityWalletBalance.remove()
+    utilityWalletInsufficientBalance.remove()
+    utilityWalletMissingBalance.remove()
+
+    const executorWalletsBalances = new Gauge({
+        name: "alto_executor_wallet_balance",
+        help: "Balance of the executor wallet",
+        labelNames: ["wallet"] as const,
+        registers
+    })
+
+    const executorWalletsMinBalance = new Gauge({
+        name: "alto_executor_wallets_min_balance",
+        help: "Minimum balance of the executor wallets",
+        labelNames: [] as const,
+        registers
+    })
+
+    const executorWalletsRequiredBalance = new Gauge({
+        name: "alto_executor_wallets_required_balance",
+        help: "Total minimum balance required across all executor wallets",
+        labelNames: [] as const,
+        registers
+    })
+
+    const walletsProcessingTime = new Histogram({
+        name: "alto_executor_wallets_processing_duration_seconds",
+        help: "Time spent processing user operations by executor wallets",
+        labelNames: [] as const,
+        registers
+    })
+
+    const altoSecondValidationFailed = new Counter({
+        name: "alto_second_validation_failed",
+        help: "Number of times alto's second estimation failed during eth_estimateUserOperationGas and we returned 2x gas limits",
+        labelNames: [] as const,
+        registers
+    })
+
+    return {
+        httpRequests,
+        httpRequestsDuration,
+        userOpsInMempool,
+        walletsAvailable,
+        walletsTotal,
+        userOpsOnChain,
+        userOpsSubmitted,
+        bundlesIncluded,
+        bundlesSubmitted,
+        userOpsReceived,
+        userOpsValidationSuccess,
+        userOpsValidationFailure,
+        userOpInclusionDuration,
+        userOpInclusionDurationBlocks,
+        chainBlockTime,
+        verificationGasLimitEstimationTime,
+        verificationGasLimitEstimationCount,
+        replacedTransactions,
+        userOpsResubmitted,
+        userOpsDropped,
+        utilityWalletBalance,
+        utilityWalletInsufficientBalance,
+        utilityWalletMissingBalance,
+        executorWalletsBalances,
+        executorWalletsMinBalance,
+        executorWalletsRequiredBalance,
+        walletsProcessingTime,
+        userOpsSubmissionAttempts,
+        altoSecondValidationFailed
+    }
+}

@@ -1,0 +1,121 @@
+name: Release
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    uses: ./.github/workflows/build.yaml
+
+  test:
+    name: Test E2E
+    uses: ./.github/workflows/e2e.yaml
+
+  changesets:
+    name: Changesets
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v3
+        with:
+          # This makes Actions fetch all Git history so that Changesets can generate changelogs with the correct commits
+          fetch-depth: 0
+
+      - name: Install core dependencies
+        uses: ./.github/actions/install-dependencies
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Create Version Pull Request
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          version: pnpm run changeset:version
+          commit: "chore: version package"
+          title: "chore: version package"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  canary:
+    name: Release canary
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      id-token: write  # Required for OIDC
+      contents: read
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v3
+
+      - name: Install dependencies
+        uses: ./.github/actions/install-dependencies
+
+      - name: Install test dependencies
+        run: pnpm install
+
+      - name: Setup .npmrc file
+        uses: actions/setup-node@v3
+        with:
+          node-version: '24'
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Set alto version
+        run: |
+          jq --arg prop "workspaces" 'del(.[$prop])' package.json > package.tmp.json && rm package.json && cp package.tmp.json package.json && rm package.tmp.json
+          cd src
+          npm --no-git-tag-version version 0.0.0
+          npm --no-git-tag-version version $(npm pkg get version | sed 's/"//g')-$(git branch --show-current | tr -cs '[:alnum:]-' '-' | tr '[:upper:]' '[:lower:]' | sed 's/-$//').$(date +'%Y%m%dT%H%M%S')
+      - name: Build
+        run: |
+          pnpm run build:contracts && pnpm run build && jq '. + {type: "module"}' ./src/package.json > ./src/package.tmp.json && mv ./src/package.tmp.json ./src/package.json
+
+      - name: Publish alto to npm
+        run: cd src && npm publish --provenance --access public --tag $(git branch --show-current | tr -cs '[:alnum:]-' '-' | tr '[:upper:]' '[:lower:]' | sed 's/-$//')
+
+  release:
+    name: Release
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    permissions:
+      id-token: write  # Required for OIDC
+      contents: write  # Required to push git tags
+
+    steps:
+      - name: Clone repository
+        uses: actions/checkout@v3
+
+      - name: Install core dependencies
+        uses: ./.github/actions/install-dependencies
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Setup .npmrc for provenance
+        uses: actions/setup-node@v3
+        with:
+          node-version: '24'
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Build
+        run: |
+          pnpm run build:contracts && pnpm run build && jq '. + {type: "module"}' ./src/package.json > ./src/package.tmp.json && mv ./src/package.tmp.json ./src/package.json
+
+      - name: Publish to NPM
+        uses: changesets/action@a45c4d594aa4e2c509dc14a9f2b3b67ba3780d0d # v1.9.0
+        with:
+          publish: pnpm run changeset:release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true

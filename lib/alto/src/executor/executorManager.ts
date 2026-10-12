@@ -1,0 +1,924 @@
+import type { GasPriceManager } from "@alto/handlers"
+import type { Mempool } from "@alto/mempool"
+import type {
+    BundlingMode,
+    GasPriceParameters,
+    SubmittedBundleInfo,
+    UserOperationBundle
+} from "@alto/types"
+import { type Logger, type Metrics, scaleBigIntByPercent } from "@alto/utils"
+import * as sentry from "@sentry/node"
+import Redis from "ioredis"
+import type { Hex, WatchBlocksReturnType } from "viem"
+import type { AltoConfig } from "../createConfig"
+import type { BundleManager } from "./bundleManager"
+import type { Executor } from "./executor"
+import type { SenderManager } from "./senderManager"
+import { getUserOpHashes } from "./utils"
+
+// Delay before an emergency mode wallet is handed back after its bundle is
+// accepted, so the pending tx isn't raced by a reused nonce.
+const EMERGENCY_WALLET_RELEASE_DELAY_MS = 1000
+const SCALE_FACTOR = 10 // Interval increases by 10ms per task per minute
+const RPM_WINDOW = 60000 // 1 minute window in ms
+
+export class ExecutorManager {
+    private readonly senderManager: SenderManager
+    private readonly config: AltoConfig
+    private readonly executor: Executor
+    private readonly mempool: Mempool
+    private readonly logger: Logger
+    private readonly metrics: Metrics
+    private readonly gasPriceManager: GasPriceManager
+    private readonly bundleManager: BundleManager
+    private opsCount: number[] = []
+    private bundlingMode: BundlingMode
+    private unWatch: WatchBlocksReturnType | undefined
+    private redisBlockCache: {
+        redis: Redis
+        blockNumberKey: string
+        refreshGuardKey: string
+        localBlockNumber: bigint
+    } | null
+
+    private currentlyHandlingBlock = false
+    private currentlyHandlingBlockNumber: bigint | undefined
+    // Emergency mode keeps bundling when RPC reads lag but submission works.
+    // Submitted bundles are not tracked: userOps are freed on acceptance and
+    // the wallet is handed back after a short delay, so nothing waits on receipts.
+    private readonly emergencyMode: boolean
+
+    constructor({
+        config,
+        executor,
+        mempool,
+        metrics,
+        gasPriceManager,
+        senderManager,
+        bundleManager
+    }: {
+        config: AltoConfig
+        executor: Executor
+        mempool: Mempool
+        metrics: Metrics
+        gasPriceManager: GasPriceManager
+        senderManager: SenderManager
+        bundleManager: BundleManager
+    }) {
+        this.config = config
+        this.executor = executor
+        this.mempool = mempool
+        this.logger = config.getLogger(
+            { module: "executor_manager" },
+            {
+                level: config.executorLogLevel || config.logLevel
+            }
+        )
+        this.metrics = metrics
+        this.gasPriceManager = gasPriceManager
+        this.senderManager = senderManager
+        this.bundlingMode = this.config.bundleMode
+        this.bundleManager = bundleManager
+        this.emergencyMode = this.config.emergencyMode
+
+        if (config.enableHorizontalScaling && config.redisEndpoint) {
+            this.redisBlockCache = {
+                redis: new Redis(config.redisEndpoint),
+                blockNumberKey: `${config.redisKeyPrefix}:${config.chainId}:watch-blocks:value`,
+                refreshGuardKey: `${config.redisKeyPrefix}:${config.chainId}:watch-blocks:lock`,
+                localBlockNumber: 0n
+            }
+        } else {
+            this.redisBlockCache = null
+        }
+    }
+
+    start(): void {
+        if (this.bundlingMode === "auto") {
+            this.autoScalingBundling()
+        }
+    }
+
+    async setBundlingMode(bundleMode: BundlingMode): Promise<void> {
+        this.bundlingMode = bundleMode
+
+        if (bundleMode === "manual") {
+            await new Promise((resolve) =>
+                setTimeout(resolve, 2 * this.config.maxBundleInterval)
+            )
+        }
+
+        if (bundleMode === "auto") {
+            this.autoScalingBundling()
+        }
+    }
+
+    async autoScalingBundling() {
+        const now = Date.now()
+        this.opsCount = this.opsCount.filter(
+            (timestamp) => now - timestamp < RPM_WINDOW
+        )
+
+        const bundles = await this.mempool.getBundles(
+            this.config.maxBundleCount
+        )
+
+        if (bundles.length > 0) {
+            // Count total ops and add timestamps
+            const totalOps = bundles.reduce(
+                (sum, bundle) => sum + bundle.userOps.length,
+                0
+            )
+            this.opsCount.push(...new Array(totalOps).fill(Date.now()))
+        }
+
+        // Send bundles to executor
+        for (const bundle of bundles) {
+            this.sendBundleToExecutor(bundle)
+        }
+
+        const rpm = this.opsCount.length
+
+        // Calculate next interval with linear scaling
+        const nextInterval: number = Math.min(
+            this.config.minBundleInterval + rpm * SCALE_FACTOR, // Linear scaling
+            this.config.maxBundleInterval // Cap at configured max interval
+        )
+
+        if (this.bundlingMode === "auto") {
+            setTimeout(this.autoScalingBundling.bind(this), nextInterval)
+        }
+    }
+
+    private async pollBlockWithRedis(): Promise<void> {
+        // Should never happen.
+        if (!this.redisBlockCache) {
+            throw new Error("Redis block cache not configured")
+        }
+
+        // Ensure ttl is an integer.
+        const pollingInterval = Math.floor(
+            this.config.blockPollingInterval ?? this.config.blockTime / 2
+        )
+
+        try {
+            let blockNumber: bigint | null = null
+
+            // Try to acquire lock.
+            const shouldFetchBlock = await this.redisBlockCache.redis
+                .set(
+                    this.redisBlockCache.refreshGuardKey,
+                    "1",
+                    "PX",
+                    pollingInterval,
+                    "NX"
+                )
+                .catch((err: unknown) => {
+                    this.logger.warn(
+                        { err },
+                        "Redis lock check failed, falling back to RPC"
+                    )
+                    sentry.captureException(err)
+                    return "OK"
+                })
+
+            if (shouldFetchBlock === "OK") {
+                // Lock acquired, make getBlockNumber RPC call and write to cache.
+                blockNumber = await this.config.publicClient.getBlockNumber()
+
+                try {
+                    await this.redisBlockCache.redis.set(
+                        this.redisBlockCache.blockNumberKey,
+                        blockNumber.toString(),
+                        "PX",
+                        pollingInterval
+                    )
+                } catch (err) {
+                    this.logger.warn({ err }, "Redis block cache write failed")
+                    sentry.captureException(err)
+                }
+            } else {
+                // Another instance is already fetching or recently fetched, read from cached block number.
+                try {
+                    const cached = await this.redisBlockCache.redis.get(
+                        this.redisBlockCache.blockNumberKey
+                    )
+                    blockNumber = cached ? BigInt(cached) : null
+                } catch (err) {
+                    this.logger.warn({ err }, "Redis block cache read failed")
+                    sentry.captureException(err)
+                }
+
+                // Cache empty, check again next poll.
+                if (!blockNumber) {
+                    return
+                }
+            }
+
+            // If block number changed, run handleBlock().
+            if (blockNumber !== this.redisBlockCache.localBlockNumber) {
+                this.redisBlockCache.localBlockNumber = blockNumber
+                await this.handleBlock(blockNumber)
+            }
+        } catch (err) {
+            this.logger.warn({ err }, "error polling block with Redis cache")
+        }
+    }
+
+    startWatchingBlocks(): void {
+        if (this.unWatch) {
+            return
+        }
+
+        // If preconfirmationTime is set, poll at a fixed interval instead of
+        // watching blocks over RPC.
+        const fixedInterval = this.config.flashblocksPreconfirmationTime
+        if (fixedInterval) {
+            // Set up interval to call handleBlock
+            const intervalId = setInterval(async () => {
+                try {
+                    await this.handleBlock()
+                } catch (err) {
+                    this.logger.error({ err }, "error while polling blocks")
+                }
+            }, fixedInterval)
+
+            // Store cleanup function
+            this.unWatch = () => {
+                clearInterval(intervalId)
+            }
+        } else if (this.redisBlockCache) {
+            const pollingInterval =
+                this.config.blockPollingInterval ?? this.config.blockTime / 2
+            const intervalId = setInterval(async () => {
+                await this.pollBlockWithRedis()
+            }, pollingInterval)
+            this.unWatch = () => {
+                clearInterval(intervalId)
+            }
+        } else {
+            // Default behavior - watch blocks
+            this.unWatch = this.config.publicClient.watchBlocks({
+                onBlock: async (block) => {
+                    await this.handleBlock(block.number)
+                },
+                onError: (err) => {
+                    this.logger.error({ err }, "error while watching blocks")
+                },
+                includeTransactions: false,
+                emitMissed: false
+            })
+        }
+
+        this.logger.debug("started watching blocks")
+    }
+
+    async getBaseFee(): Promise<bigint> {
+        if (this.config.legacyTransactions) {
+            return 0n
+        }
+        return await this.gasPriceManager.getBaseFee()
+    }
+
+    async sendBundleToExecutor(
+        userOpBundle: UserOperationBundle
+    ): Promise<Hex | undefined> {
+        const { entryPoint, userOps, version } = userOpBundle
+        if (userOps.length === 0) {
+            return undefined
+        }
+
+        const wallet = await this.senderManager.getWallet()
+
+        const [gasPriceParams, baseFee, nonce] = await Promise.all([
+            this.gasPriceManager.tryGetNetworkGasPrice({ forExecutor: true }),
+            this.getBaseFee(),
+            this.config.publicClient.getTransactionCount({
+                address: wallet.address,
+                blockTag: "latest"
+            })
+        ]).catch((_) => {
+            return []
+        })
+
+        if (!gasPriceParams || nonce === undefined) {
+            // Free executor if failed to get initial params.
+            await this.senderManager.markWalletProcessed(wallet)
+            await this.mempool.resubmitUserOps({
+                userOps,
+                entryPoint,
+                reason: "Failed to get nonce and gas parameters for bundling"
+            })
+            return undefined
+        }
+
+        const bundleResult = await this.executor.bundle({
+            executor: wallet,
+            userOpBundle,
+            networkGasPrice: gasPriceParams,
+            networkBaseFee: baseFee,
+            nonce
+        })
+
+        if (!bundleResult.success) {
+            const { rejectedUserOps, recoverableOps, reason } = bundleResult
+
+            // Recover any userOps that can be resubmitted.
+            await this.mempool.resubmitUserOps({
+                userOps: recoverableOps,
+                entryPoint,
+                reason
+            })
+
+            // For rejected userOps, we need to check for frontruns
+            const shouldCheckFrontrun = rejectedUserOps.some(
+                ({ reason }) =>
+                    reason.includes("AA25 invalid account nonce") ||
+                    reason.includes("AA10 sender already constructed")
+            )
+
+            if (shouldCheckFrontrun) {
+                // Check each rejected userOp for frontrun or included
+                const results = await Promise.all(
+                    rejectedUserOps.map(async (userOpInfo) => ({
+                        userOpInfo,
+                        status: await this.bundleManager.getUserOpStatus({
+                            userOpInfo,
+                            entryPoint,
+                            bundlerTxs: [],
+                            blockReceivedTimestamp: Date.now()
+                        })
+                    }))
+                )
+
+                // Drop userOps that were rejected but not frontrun or included
+                const notFoundUserOps = results
+                    .filter(({ status }) => status === "not_found")
+                    .map(({ userOpInfo }) => userOpInfo)
+
+                await this.mempool.dropUserOps(entryPoint, notFoundUserOps)
+
+                // Stop tracking userOps that were included onchain either due to frontrun or included
+                const confirmedUserOps = results
+                    .filter(({ status }) =>
+                        ["frontran", "included"].includes(status)
+                    )
+                    .map(({ userOpInfo }) => userOpInfo)
+
+                await this.mempool.removeProcessing({
+                    entryPoint,
+                    userOps: confirmedUserOps
+                })
+            } else {
+                this.logger.warn(
+                    {
+                        reason,
+                        userOps: getUserOpHashes(rejectedUserOps)
+                    },
+                    "failed to send bundle transaction"
+                )
+
+                await this.mempool.dropUserOps(entryPoint, rejectedUserOps)
+            }
+
+            // Free wallet as no bundle was sent.
+            await this.senderManager.markWalletProcessed(wallet)
+
+            this.metrics.userOpsSubmitted
+                .labels({ status: "failed" })
+                .inc(rejectedUserOps.length)
+
+            if (reason === "filterops_failed" || reason === "generic_error") {
+                this.metrics.bundlesSubmitted.labels({ status: "failed" }).inc()
+            }
+
+            return undefined
+        }
+
+        // Success case
+        let {
+            userOpsBundled,
+            rejectedUserOps,
+            transactionRequest,
+            transactionHash
+        } = bundleResult
+
+        // Increment submission attempts for all userOps submitted.
+        userOpsBundled = userOpsBundled.map((userOpInfo) => ({
+            ...userOpInfo,
+            submissionAttempts: userOpInfo.submissionAttempts + 1
+        }))
+
+        const submittedBundle: SubmittedBundleInfo = {
+            uid: transactionHash,
+            executor: wallet,
+            transactionHash,
+            transactionRequest,
+            bundle: {
+                entryPoint,
+                version,
+                userOps: userOpsBundled,
+                submissionAttempts: 1
+            },
+            previousTransactionHashes: [],
+            lastReplaced: Date.now()
+        }
+
+        if (this.emergencyMode) {
+            // Receipts can't be relied on, free the userOps now and the wallet
+            // after a short delay.
+            await this.mempool.removeProcessing({
+                entryPoint,
+                userOps: submittedBundle.bundle.userOps
+            })
+            setTimeout(() => {
+                this.senderManager.markWalletProcessed(wallet).catch((err) => {
+                    this.logger.error({ err }, "failed to release wallet")
+                })
+            }, EMERGENCY_WALLET_RELEASE_DELAY_MS)
+        } else {
+            // Track bundle and start loop to watch blocks.
+            this.bundleManager.trackBundle(submittedBundle)
+            this.startWatchingBlocks()
+        }
+
+        await this.mempool.markUserOpsAsSubmitted({
+            userOps: submittedBundle.bundle.userOps,
+            transactionHash: submittedBundle.transactionHash
+        })
+
+        await this.mempool.dropUserOps(entryPoint, rejectedUserOps)
+        this.metrics.bundlesSubmitted.labels({ status: "success" }).inc()
+
+        return transactionHash
+    }
+
+    stopWatchingBlocks(): void {
+        if (this.unWatch) {
+            this.unWatch()
+            this.unWatch = undefined
+        }
+    }
+
+    private async handleBlock(blockNumber?: bigint) {
+        if (this.currentlyHandlingBlock) {
+            if (
+                blockNumber !== undefined &&
+                this.currentlyHandlingBlockNumber !== undefined
+            ) {
+                this.logger.warn(
+                    {
+                        currentBlock:
+                            this.currentlyHandlingBlockNumber.toString(),
+                        skippedBlock: blockNumber.toString()
+                    },
+                    "skipping block event, previous block still being handled"
+                )
+            }
+            return
+        }
+
+        this.currentlyHandlingBlock = true
+        this.currentlyHandlingBlockNumber = blockNumber
+        const blockReceivedTimestamp = Date.now()
+
+        const pendingBundles = this.bundleManager.getPendingBundles()
+
+        // Keep watching while inclusions still await their reorg check.
+        if (
+            pendingBundles.length === 0 &&
+            !this.bundleManager.hasIncludedBundles()
+        ) {
+            this.stopWatchingBlocks()
+            this.currentlyHandlingBlock = false
+            this.currentlyHandlingBlockNumber = undefined
+            return
+        }
+
+        // Make reorg check if configured.
+        if (this.config.reorgConfirmationDepth > 0) {
+            this.bundleManager.checkIncludedBundles({
+                blockNumber,
+                reorgConfirmationDepth: BigInt(
+                    this.config.reorgConfirmationDepth
+                ),
+                blockReceivedTimestamp
+            })
+        }
+
+        if (pendingBundles.length === 0) {
+            this.currentlyHandlingBlock = false
+            this.currentlyHandlingBlockNumber = undefined
+            return
+        }
+
+        const [bundleStatuses, networkGasPrice, networkBaseFee] =
+            await Promise.all([
+                this.bundleManager.getBundleStatuses(pendingBundles),
+                this.gasPriceManager
+                    .tryGetNetworkGasPrice({ forExecutor: true })
+                    .catch(() => ({
+                        maxFeePerGas: 0n,
+                        maxPriorityFeePerGas: 0n
+                    })),
+                this.getBaseFee().catch(() => 0n)
+            ])
+
+        await Promise.all(
+            bundleStatuses.map(async (bundleStatus, index) => {
+                if (bundleStatus.status === "included") {
+                    await this.bundleManager.processIncludedBundle({
+                        submittedBundle: pendingBundles[index],
+                        bundleReceipt: bundleStatus,
+                        blockReceivedTimestamp
+                    })
+                }
+
+                if (bundleStatus.status === "reverted") {
+                    await this.bundleManager.processRevertedBundle({
+                        blockReceivedTimestamp,
+                        submittedBundle: pendingBundles[index],
+                        bundleReceipt: bundleStatus
+                    })
+                }
+
+                // can be potentially resubmitted - so we first submit it again to optimize for the speed
+                if (bundleStatus.status === "not_found") {
+                    this.potentiallyResubmitBundle({
+                        blockReceivedTimestamp,
+                        submittedBundle: pendingBundles[index],
+                        networkGasPrice,
+                        networkBaseFee
+                    })
+                }
+
+                // Internal error - clean up the bundle so it doesn't get stuck
+                if (bundleStatus.status === "internal_error") {
+                    await this.bundleManager.processInternalErrorBundle({
+                        submittedBundle: pendingBundles[index],
+                        error: bundleStatus.error
+                    })
+                }
+            })
+        )
+
+        this.currentlyHandlingBlock = false
+        this.currentlyHandlingBlockNumber = undefined
+    }
+
+    potentiallyResubmitBundle({
+        blockReceivedTimestamp,
+        submittedBundle,
+        networkGasPrice,
+        networkBaseFee
+    }: {
+        blockReceivedTimestamp: number
+        submittedBundle: SubmittedBundleInfo
+        networkGasPrice: {
+            maxFeePerGas: bigint
+            maxPriorityFeePerGas: bigint
+        }
+        networkBaseFee: bigint
+    }) {
+        const { transactionRequest, lastReplaced } = submittedBundle
+        const { maxFeePerGas, maxPriorityFeePerGas } = transactionRequest
+
+        const replacementPercent =
+            100n + this.config.gasPriceReplacementThreshold
+
+        const maxFeeThreshold = scaleBigIntByPercent(
+            maxFeePerGas,
+            replacementPercent
+        )
+        const maxPriorityFeeThreshold = scaleBigIntByPercent(
+            maxPriorityFeePerGas,
+            replacementPercent
+        )
+
+        const isGasPriceTooLow =
+            networkGasPrice.maxFeePerGas > maxFeeThreshold ||
+            networkGasPrice.maxPriorityFeePerGas > maxPriorityFeeThreshold
+
+        const isStuck =
+            Date.now() - lastReplaced > this.config.resubmitStuckTimeout
+
+        if (isGasPriceTooLow) {
+            this.bundleManager.stopTrackingBundle(submittedBundle)
+            this.replaceBundle({
+                blockReceivedTimestamp,
+                submittedBundle,
+                networkGasPrice,
+                networkBaseFee,
+                reason: "gas_price"
+            })
+        } else if (isStuck) {
+            this.bundleManager.stopTrackingBundle(submittedBundle)
+            this.replaceBundle({
+                blockReceivedTimestamp,
+                submittedBundle,
+                networkGasPrice,
+                networkBaseFee,
+                reason: "stuck"
+            })
+        }
+    }
+
+    async cancelBundle(submittedBundle: SubmittedBundleInfo): Promise<void> {
+        const {
+            bundle: { userOps },
+            executor,
+            transactionRequest,
+            transactionHash
+        } = submittedBundle
+
+        const { walletClients, publicClient, blockTime } = this.config
+        const walletClient = walletClients.public
+        const logger = this.logger.child({
+            userOps: getUserOpHashes(userOps)
+        })
+
+        let gasMultiplier = 150n // Start with 50% increase
+
+        for (let attempt = 0; attempt < 5; attempt++) {
+            try {
+                // Check if transaction is still pending
+                const currentNonce = await publicClient.getTransactionCount({
+                    address: executor.address,
+                    blockTag: "latest"
+                })
+
+                if (currentNonce > transactionRequest.nonce) {
+                    logger.info("Transaction already mined or cancelled")
+                    return
+                }
+
+                logger.info(`Trying to cancel bundle, attempt ${attempt + 1}`)
+
+                // Send cancel transaction with increasing gas price
+                const cancelTxHash = await walletClient.sendTransaction({
+                    account: executor,
+                    to: executor.address,
+                    value: 0n,
+                    nonce: transactionRequest.nonce,
+                    maxFeePerGas: scaleBigIntByPercent(
+                        transactionRequest.maxFeePerGas,
+                        gasMultiplier
+                    ),
+                    maxPriorityFeePerGas: scaleBigIntByPercent(
+                        transactionRequest.maxPriorityFeePerGas,
+                        gasMultiplier
+                    )
+                })
+
+                logger.info(
+                    {
+                        originalTxHash: transactionHash,
+                        cancelTxHash,
+                        attempt: attempt + 1
+                    },
+                    "cancel transaction sent"
+                )
+
+                // Wait for transaction to potentially be mined
+                await new Promise((resolve) =>
+                    setTimeout(resolve, blockTime / 2)
+                )
+            } catch (err) {
+                logger.warn({ err }, "failed to cancel bundle")
+                gasMultiplier += 20n // Increase gas by additional 20% each retry
+            }
+        }
+
+        // All retries exhausted
+        logger.error(
+            { transactionHash },
+            "failed to cancel bundle after max retries"
+        )
+    }
+
+    async replaceBundle({
+        blockReceivedTimestamp,
+        submittedBundle,
+        networkGasPrice,
+        networkBaseFee,
+        reason
+    }: {
+        blockReceivedTimestamp: number
+        submittedBundle: SubmittedBundleInfo
+        networkGasPrice: GasPriceParameters
+        networkBaseFee: bigint
+        reason: "gas_price" | "stuck"
+    }): Promise<void> {
+        const {
+            bundle,
+            executor,
+            transactionRequest,
+            transactionHash: oldTxHash
+        } = submittedBundle
+
+        const { entryPoint } = bundle
+
+        const bundleResult = await this.executor.bundle({
+            executor: executor,
+            networkGasPrice,
+            networkBaseFee,
+            userOpBundle: bundle,
+            nonce: transactionRequest.nonce,
+            isReplacement: true
+        })
+
+        // The nonce of the bundle we tried to replace was consumed whilst
+        // replacing it.
+        if (!bundleResult.success && bundleResult.reason === "nonce_conflict") {
+            const [bundleStatus] = await this.bundleManager.getBundleStatuses([
+                submittedBundle
+            ])
+
+            // One of the bundle's own transactions was mined - resolve the
+            // userOps against it now (inclusion, reverts, wallet release)
+            // instead of resending and reverting with AA25.
+            if (
+                bundleStatus.status === "included" ||
+                bundleStatus.status === "reverted"
+            ) {
+                this.logger.info(
+                    {
+                        oldTxHash,
+                        minedTxHash: bundleStatus.transactionHash,
+                        reason,
+                        userOps: getUserOpHashes(bundle.userOps)
+                    },
+                    "bundle mined during replacement, skipping replacement"
+                )
+
+                this.metrics.replacedTransactions
+                    .labels({ reason, status: "already_mined" })
+                    .inc()
+            }
+
+            if (bundleStatus.status === "included") {
+                await this.bundleManager.processIncludedBundle({
+                    submittedBundle,
+                    bundleReceipt: bundleStatus,
+                    blockReceivedTimestamp
+                })
+                return
+            }
+
+            if (bundleStatus.status === "reverted") {
+                await this.bundleManager.processRevertedBundle({
+                    submittedBundle,
+                    bundleReceipt: bundleStatus,
+                    blockReceivedTimestamp
+                })
+                return
+            }
+
+            // The nonce was consumed by an unknown transaction (e.g. a
+            // cancel tx) - the userOps didn't land onchain, fall through to
+            // the failure handling below to resubmit them and free the
+            // wallet.
+        }
+
+        // Handle case where no bundle was sent.
+        if (!bundleResult.success) {
+            const {
+                rejectedUserOps,
+                recoverableOps,
+                reason: failureReason
+            } = bundleResult
+
+            // Recover any userOps that can be resubmitted.
+            await this.mempool.resubmitUserOps({
+                userOps: recoverableOps,
+                entryPoint,
+                reason: failureReason
+            })
+
+            // For rejected userOps, we need to check for frontruns
+            const shouldCheckFrontrun = rejectedUserOps.some(
+                ({ reason }) =>
+                    reason.includes("AA25 invalid account nonce") ||
+                    reason.includes("AA10 sender already constructed")
+            )
+
+            if (shouldCheckFrontrun) {
+                // Check each rejected userOp for frontrun or included
+                const results = await Promise.all(
+                    rejectedUserOps.map(async (userOpInfo) => ({
+                        userOpInfo,
+                        status: await this.bundleManager.getUserOpStatus({
+                            userOpInfo,
+                            entryPoint,
+                            bundlerTxs: [
+                                submittedBundle.transactionHash,
+                                ...submittedBundle.previousTransactionHashes
+                            ],
+                            blockReceivedTimestamp
+                        })
+                    }))
+                )
+
+                const hasFrontrun = results.some(
+                    ({ status }) => status === "frontran"
+                )
+
+                // If one userOp in the bundle was frontrun, we need to cancel the entire bundle
+                // as it will fail onchain
+                if (hasFrontrun) {
+                    await this.cancelBundle(submittedBundle)
+                }
+
+                // Drop userOps that were rejected but not frontrun or included
+                const notFoundUserOps = results
+                    .filter(({ status }) => status === "not_found")
+                    .map(({ userOpInfo }) => userOpInfo)
+
+                await this.mempool.dropUserOps(entryPoint, notFoundUserOps)
+
+                // Stop tracking userOps that were included onchain either due to frontrun or included
+                const confirmedUserOps = results
+                    .filter(({ status }) =>
+                        ["frontran", "included"].includes(status)
+                    )
+                    .map(({ userOpInfo }) => userOpInfo)
+
+                await this.mempool.removeProcessing({
+                    entryPoint,
+                    userOps: confirmedUserOps
+                })
+            } else {
+                this.logger.warn(
+                    {
+                        oldTxHash,
+                        reason,
+                        failureReason,
+                        userOps: getUserOpHashes(rejectedUserOps)
+                    },
+                    "failed to replace bundle"
+                )
+
+                await this.mempool.dropUserOps(entryPoint, rejectedUserOps)
+            }
+
+            // Free wallet as no bundle was sent.
+            await this.senderManager.markWalletProcessed(executor)
+
+            this.metrics.replacedTransactions
+                .labels({ reason, status: "failed" })
+                .inc()
+
+            return
+        }
+
+        // Success case
+        const {
+            rejectedUserOps,
+            userOpsBundled,
+            transactionRequest: newTransactionRequest,
+            transactionHash: newTxHash
+        } = bundleResult
+
+        // Increment submission attempts for all replaced userOps
+        const userOpsReplaced = userOpsBundled.map((userOpInfo) => ({
+            ...userOpInfo,
+            submissionAttempts: userOpInfo.submissionAttempts + 1
+        }))
+
+        const newSubmittedBundle: SubmittedBundleInfo = {
+            ...submittedBundle,
+            transactionRequest: newTransactionRequest,
+            transactionHash: newTxHash,
+            previousTransactionHashes: [
+                submittedBundle.transactionHash,
+                ...submittedBundle.previousTransactionHashes
+            ],
+            lastReplaced: Date.now(),
+            bundle: {
+                ...bundle,
+                userOps: userOpsReplaced,
+                submissionAttempts: bundle.submissionAttempts + 1
+            }
+        }
+
+        // Track bundle and start loop to watch blocks
+        this.bundleManager.trackBundle(newSubmittedBundle)
+        this.startWatchingBlocks()
+
+        // Drop all userOperations that were rejected during simulation.
+        await this.mempool.dropUserOps(entryPoint, rejectedUserOps)
+
+        this.logger.info(
+            {
+                oldTxHash,
+                newTxHash,
+                reason,
+                userOps: getUserOpHashes(userOpsReplaced)
+            },
+            "replaced bundle"
+        )
+        this.metrics.replacedTransactions
+            .labels({ reason, status: "success" })
+            .inc()
+    }
+}

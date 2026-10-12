@@ -1,0 +1,318 @@
+import {
+    EntryPointV06Abi,
+    EntryPointV07Abi,
+    type PackedUserOperation,
+    type UserOpInfo,
+    type UserOperation,
+    type UserOperation07
+} from "@alto/types"
+import {
+    type Logger,
+    isVersion06,
+    isVersion07,
+    scaleBigIntByPercent,
+    toPackedUserOp
+} from "@alto/utils"
+import * as sentry from "@sentry/node"
+import {
+    type Account,
+    type Address,
+    type BaseError,
+    FeeCapTooLowError,
+    type Hex,
+    type SignedAuthorizationList,
+    encodeFunctionData,
+    toBytes
+} from "viem"
+import type { AltoConfig } from "../createConfig"
+import { getEip7702AuthAddress } from "../utils/eip7702"
+
+// Thrown during a replacement when the executor nonce was consumed by another
+// transaction. The caller resolves whether it was one of the bundle's own
+// transactions (resending would revert with AA25) or an unknown transaction
+// (the userOps can be resubmitted).
+export class ReplacementNonceConflictError extends Error {
+    constructor() {
+        super("Replacement nonce consumed by another transaction")
+        this.name = "ReplacementNonceConflictError"
+    }
+}
+
+export const getBundleGasLimit = async ({
+    config,
+    userOps,
+    entryPoint,
+    executorAddress
+}: {
+    config: AltoConfig
+    userOps: UserOperation[]
+    entryPoint: Address
+    executorAddress: Address
+}): Promise<bigint> => {
+    const { skipLocalGasCalculations, publicClient } = config
+
+    let gasLimit: bigint
+
+    // On some chains we can't rely on local calculations and have to estimate the gasLimit from RPC
+    if (skipLocalGasCalculations) {
+        const authorizationList = getAuthorizationListFromUserOps(userOps)
+
+        gasLimit = await publicClient.estimateGas({
+            to: entryPoint,
+            account: executorAddress,
+            data: encodeHandleOpsCalldata({
+                userOps: userOps,
+                beneficiary: executorAddress
+            }),
+            authorizationList
+        })
+    } else {
+        const aa95GasFloor = calculateAA95GasFloor({
+            userOps: userOps,
+            beneficiary: executorAddress
+        })
+
+        const eip7702UserOpCount = userOps.filter(
+            (userOp) => userOp.eip7702Auth
+        ).length
+        const eip7702Overhead = BigInt(eip7702UserOpCount) * 40_000n
+
+        gasLimit = aa95GasFloor + eip7702Overhead
+    }
+
+    return scaleBigIntByPercent(gasLimit, config.executorGasMultiplier)
+}
+
+export const isTransactionUnderpricedError = (e: BaseError) => {
+    const transactionUnderPriceError = e.walk((e: any) => {
+        const message = e?.message?.toLowerCase()
+        return (
+            message?.includes("replacement transaction underpriced") || // Geth error message
+            message?.includes("could not replace existing tx") // Erigon error message
+        )
+    })
+    return transactionUnderPriceError !== null
+}
+
+// Viem wraps node errors, so FeeCapTooLowError arrives nested in the
+// cause chain rather than as the thrown value.
+export const isFeeCapTooLowError = (e: BaseError) => {
+    return e.walk((err) => err instanceof FeeCapTooLowError) !== null
+}
+
+// Some nodes report the account's actual nonce in their "nonce too low" /
+// "nonce too high" rejection. Viem keeps the raw node message in `details`.
+//   nitro:        "nonce too low: address 0x.., tx: 389 state: 392"
+//   geth/op-geth: "nonce too low: next nonce 392, tx nonce 389"
+// Returns undefined when the message carries no nonce so callers can fall
+// back to a blind +1 / -1 adjustment.
+const NODE_NONCE_PATTERNS = [/\bstate:\s*(\d+)/i, /\bnext nonce\s*(\d+)/i]
+
+export const parseNonceFromError = (e: BaseError): number | undefined => {
+    const details = e.details
+    if (!details) {
+        return undefined
+    }
+
+    for (const pattern of NODE_NONCE_PATTERNS) {
+        const match = details.match(pattern)
+        if (match) {
+            const nonce = Number(match[1])
+            if (Number.isSafeInteger(nonce)) {
+                return nonce
+            }
+        }
+    }
+
+    return undefined
+}
+
+// V7 source: https://github.com/eth-infinitism/account-abstraction/blob/releases/v0.7/contracts/core/EntryPoint.sol
+// V6 source: https://github.com/eth-infinitism/account-abstraction/blob/fa61290d37d079e928d92d53a122efcc63822214/contracts/core/EntryPoint.sol#L236
+export function calculateAA95GasFloor({
+    userOps,
+    beneficiary
+}: { userOps: UserOperation[]; beneficiary: Address }): bigint {
+    let gasFloor = 0n
+
+    for (const userOp of userOps) {
+        if (isVersion07(userOp)) {
+            const totalGas =
+                userOp.callGasLimit +
+                (userOp.paymasterPostOpGasLimit || 0n) +
+                10_000n // INNER_GAS_OVERHEAD
+
+            gasFloor += (totalGas * 64n) / 63n
+
+            // AA95 check happens after verification + paymaster verification
+            gasFloor +=
+                userOp.verificationGasLimit +
+                (userOp.paymasterVerificationGasLimit || 0n)
+
+            // There is a ~27,170 gas overhead for EntryPoint's re-entrency check
+            gasFloor += 30_000n
+
+            // There is a variable gas overhead for calldata gas when calling handleOps
+            const calldata = encodeHandleOpsCalldata({
+                userOps: [userOp],
+                beneficiary
+            })
+            const handleOpsCalldataCost = toBytes(calldata)
+                .map((x) => (x === 0 ? 4 : 16))
+                .reduce((sum, x) => sum + x)
+
+            gasFloor += BigInt(handleOpsCalldataCost)
+        } else {
+            gasFloor +=
+                userOp.callGasLimit + userOp.verificationGasLimit + 5000n
+
+            // AA95 check happens after verification + paymaster verification
+            gasFloor += userOp.verificationGasLimit
+
+            // There is a ~27,179 gas overhead for EntryPoint's re-entrency check
+            gasFloor += 30_000n
+
+            // There is a variable gas overhead for calldata gas when calling handleOps
+            const calldata = encodeHandleOpsCalldata({
+                userOps: [userOp],
+                beneficiary
+            })
+            const handleOpsCalldataCost = toBytes(calldata)
+                .map((x) => (x === 0 ? 4 : 16))
+                .reduce((sum, x) => sum + x)
+
+            gasFloor += BigInt(handleOpsCalldataCost)
+        }
+    }
+
+    return gasFloor
+}
+
+export const getUserOpHashes = (userOpInfos: UserOpInfo[]) => {
+    return userOpInfos.map(({ userOpHash }) => userOpHash)
+}
+
+export const packUserOps = (userOps: UserOperation[]) => {
+    if (userOps.length === 0) {
+        return []
+    }
+
+    const is06 = isVersion06(userOps[0])
+
+    const packedUserOps = is06
+        ? userOps
+        : userOps.map((userOp) => toPackedUserOp(userOp as UserOperation07))
+
+    return packedUserOps as PackedUserOperation[]
+}
+
+export const encodeHandleOpsCalldata = ({
+    userOps,
+    beneficiary
+}: {
+    userOps: UserOperation[]
+    beneficiary: Address
+}): Hex => {
+    const isV06 = isVersion06(userOps[0])
+    const packedUserOps = packUserOps(userOps)
+
+    return encodeFunctionData({
+        abi: isV06 ? EntryPointV06Abi : EntryPointV07Abi,
+        functionName: "handleOps",
+        args: [packedUserOps, beneficiary]
+    })
+}
+
+export const getAuthorizationListFromUserOps = (
+    userOps: UserOperation[]
+): SignedAuthorizationList | undefined => {
+    const authMap = new Map<Address, SignedAuthorizationList[number]>()
+
+    // Deduplicate EIP-7702 auths if userOp.sender has multiple same eip7702Auth fields.
+    for (const userOp of userOps) {
+        const { eip7702Auth, sender } = userOp
+        if (eip7702Auth && !authMap.has(sender)) {
+            authMap.set(sender, {
+                address: getEip7702AuthAddress(eip7702Auth),
+                chainId: eip7702Auth.chainId,
+                nonce: eip7702Auth.nonce,
+                r: eip7702Auth.r,
+                s: eip7702Auth.s,
+                v: eip7702Auth.v,
+                yParity: eip7702Auth.yParity
+            })
+        }
+    }
+
+    const authList = Array.from(authMap.values()) as SignedAuthorizationList
+    return authList.length > 0 ? authList : undefined
+}
+
+export async function flushStuckTransaction({
+    config,
+    wallet,
+    gasPrice,
+    logger
+}: {
+    config: AltoConfig
+    wallet: Account
+    gasPrice: bigint
+    logger: Logger
+}) {
+    const publicClient = config.publicClient
+    const walletClient = config.walletClients.public
+
+    const latestNonce = await publicClient.getTransactionCount({
+        address: wallet.address,
+        blockTag: "latest"
+    })
+    const pendingNonce = await publicClient.getTransactionCount({
+        address: wallet.address,
+        blockTag: "pending"
+    })
+
+    logger.debug(
+        { latestNonce, pendingNonce, wallet: wallet.address },
+        "checking for stuck transactions"
+    )
+
+    // same nonce is okay
+    if (latestNonce === pendingNonce) {
+        return
+    }
+
+    // one nonce ahead is also okay
+    if (latestNonce + 1 === pendingNonce) {
+        return
+    }
+
+    logger.info(
+        { latestNonce, pendingNonce, wallet: wallet.address },
+        "found stuck transaction, flushing"
+    )
+
+    for (
+        let nonceToFlush = latestNonce;
+        nonceToFlush < pendingNonce;
+        nonceToFlush++
+    ) {
+        try {
+            const txHash = await walletClient.sendTransaction({
+                account: wallet,
+                to: wallet.address,
+                value: 0n,
+                nonce: nonceToFlush,
+                maxFeePerGas: gasPrice,
+                maxPriorityFeePerGas: gasPrice
+            })
+
+            logger.debug(
+                { txHash, nonce: nonceToFlush, wallet: wallet.address },
+                "flushed stuck transaction"
+            )
+        } catch (err) {
+            sentry.captureException(err)
+            logger.warn({ err }, "error flushing stuck transaction")
+        }
+    }
+}

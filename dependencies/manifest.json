@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "hash_algorithm": "sha256(path NUL size NUL bytes, sorted by relative path)",
+  "dependencies": {
+    "aa": {
+      "upstream": "https://github.com/eth-infinitism/account-abstraction",
+      "revision": "b36a1ed52ae00da6f8a4c8d50181e2877e4fa410",
+      "files": 127,
+      "tree_sha256": "0fcdddc72c9127b665975e2fcb7207aa27f3844a7b95d6c927179ad508fe3b67"
+    },
+    "oz": {
+      "upstream": "https://github.com/OpenZeppelin/openzeppelin-contracts",
+      "revision": "cab19933c33c2ad1d4c7a84864a3601dddfd16f3",
+      "files": 875,
+      "tree_sha256": "e2a0b9e539b76c46ab0936f9e7fdecbc6c5bda4ab3a514cb729ad229c71f2254"
+    },
+    "alto": {
+      "upstream": "https://github.com/pimlicolabs/alto",
+      "revision": "96529592b67a69be23c013359cbc9990657af64a",
+      "snapshot_revision": "eff44dea4d11d63f72a5593249c75653d8ff719a",
+      "files": 2848,
+      "tree_sha256": "69b1b06b6236ea68f2326b19bb76eafd1eea603fd7225d51f68c1a00132390ea"
+    }
+  }
+}
